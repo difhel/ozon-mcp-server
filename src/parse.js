@@ -46,8 +46,12 @@ function priceToNumber(text) {
 /** strip ?at=... tracking and make absolute */
 function cleanUrl(link, origin = "https://www.ozon.ru") {
   if (!link) return null;
-  const path = String(link).split("?")[0];
-  return path.startsWith("http") ? path : `${origin}${path}`;
+  const raw = String(link).split("?")[0];
+  try {
+    return new URL(raw, origin).href;
+  } catch {
+    return null;
+  }
 }
 
 /** pull the numeric sku out of a product url/slug: ...-1185261285/ -> "1185261285" */

@@ -10,11 +10,12 @@
 
 import { chromium } from "playwright";
 
-const HOME = "https://www.ozon.ru/";
+const DEFAULT_HOME = "https://www.ozon.ru/";
 const API_PATH = "/api/composer-api.bx/page/json/v2?url=";
 const CHALLENGE_WAIT_MS = 12000;
 const IDLE_TIMEOUT_MS = 10 * 60 * 1000;
 const NAV_TIMEOUT_MS = 90000;
+const CAPTCHA_ERROR = "Ozon CAPTCHA required / public session unavailable";
 
 const LAUNCH_ARGS = [
   "--disable-blink-features=AutomationControlled",
@@ -28,8 +29,6 @@ const LAUNCH_ARGS = [
   "--disable-extensions",
   "--disable-background-networking",
 ];
-const USER_AGENT =
-  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.7778.0 Safari/537.36";
 
 const log = (...a) => console.error("[browser]", ...a);
 
@@ -41,6 +40,27 @@ let challenged = false;
 let effectiveOrigin = null;
 let idleTimer = null;
 
+export function isOzonHost(hostname) {
+  return /(^|\.)ozon\.(ru|com)$/i.test(String(hostname || ""));
+}
+
+export function validateOzonHome(value = DEFAULT_HOME) {
+  let u;
+  try {
+    u = new URL(value || DEFAULT_HOME);
+  } catch {
+    throw new Error("OZON_HOME must be a valid HTTPS Ozon origin");
+  }
+  if (u.protocol !== "https:") throw new Error("OZON_HOME must use https://");
+  if (u.username || u.password) throw new Error("OZON_HOME must not contain credentials");
+  if (!isOzonHost(u.hostname)) throw new Error("OZON_HOME must be an Ozon-owned host (*.ozon.ru or *.ozon.com)");
+  if (u.search || u.hash) throw new Error("OZON_HOME must be an origin only, without query or fragment");
+  if (u.pathname !== "/" && u.pathname !== "") throw new Error("OZON_HOME must be an origin only, without a path");
+  return `${u.origin}/`;
+}
+
+const HOME = validateOzonHome(process.env.OZON_HOME);
+
 function resetIdle() {
   clearTimeout(idleTimer);
   idleTimer = setTimeout(() => {
@@ -48,10 +68,6 @@ function resetIdle() {
     shutdown().catch(() => {});
   }, IDLE_TIMEOUT_MS);
   idleTimer.unref();
-}
-
-function isOzonHost(hostname) {
-  return /(^|\.)ozon\.(ru|com)$/i.test(hostname);
 }
 
 function safeUrl(url) {
@@ -71,28 +87,41 @@ function looksLikeCaptchaText(text = "") {
   return /antibot|captcha|captchaURL|incidentId|капч|пазл|подтвердите,? что вы не бот|ограничен|доступ/i.test(text);
 }
 
+function captchaError(status) {
+  return new Error(`${CAPTCHA_ERROR} (HTTP ${status})`);
+}
+
 function pageOrigin() {
   try {
     const u = new URL(mainPage?.url() || HOME);
-    if (!isOzonHost(u.hostname)) throw new Error(`unexpected Ozon page host: ${u.hostname}`);
+    if (u.protocol !== "https:" || !isOzonHost(u.hostname)) throw new Error(`unexpected Ozon page origin: ${u.origin}`);
     return u.origin;
   } catch (err) {
     throw new Error(`Cannot determine safe Ozon origin: ${err?.message || err}`);
   }
 }
 
-function ozonRedirectTarget(redirectUrl) {
-  const u = new URL(redirectUrl, mainPage?.url() || HOME);
+function safeOzonUrl(url, base = HOME) {
+  const u = new URL(url, base);
+  if (u.protocol !== "https:") throw new Error(`Refusing non-HTTPS Ozon URL: ${u.protocol}`);
+  if (u.username || u.password) throw new Error("Refusing Ozon URL with credentials");
+  if (!isOzonHost(u.hostname)) throw new Error(`Refusing non-Ozon host: ${u.hostname}`);
+  return u;
+}
+
+export function ozonRedirectTarget(redirectUrl, base = HOME) {
+  const u = safeOzonUrl(redirectUrl, base);
   if (u.pathname === "/ozonid/domain_redirect" && u.searchParams.get("domain")) {
     const domain = u.searchParams.get("domain");
-    if (!isOzonHost(domain)) throw new Error(`Refusing non-Ozon redirect domain: ${domain}`);
+    if (!/^[a-z0-9.-]+$/i.test(domain) || !isOzonHost(domain)) {
+      throw new Error(`Refusing non-Ozon redirect domain: ${domain}`);
+    }
     const redirectUri = u.searchParams.get("redirect_uri") || "/";
     if (!redirectUri.startsWith("/") || redirectUri.startsWith("//")) {
       throw new Error("Refusing unsafe Ozon redirect path");
     }
     return `https://${domain}${redirectUri}`;
   }
-  if (!isOzonHost(u.hostname)) throw new Error(`Refusing non-Ozon redirect host: ${u.hostname}`);
   return u.href;
 }
 
@@ -106,16 +135,27 @@ async function fetchComposerText(sitePath) {
   }, { apiPath: API_PATH, sitePath });
 }
 
-function parseComposerBody(body) {
-  if (body.status === 403 || looksLikeCaptchaText(body.text)) {
-    throw new Error(`Ozon CAPTCHA required / public session unavailable (HTTP ${body.status})`);
-  }
+function isCaptchaJson(data) {
+  if (!data || typeof data !== "object") return false;
+  if (data.widgetStates) return false;
+  if (data.incidentId || data.blockURL || data.supportURL) return true;
+  return looksLikeCaptchaText(JSON.stringify(data).slice(0, 2000));
+}
+
+export function parseComposerBody(body) {
+  if (body.status === 403) throw captchaError(body.status);
   if (body.status !== 200) throw new Error(`Ozon returned HTTP ${body.status}`);
+
+  let data;
   try {
-    return JSON.parse(body.text);
+    data = JSON.parse(body.text);
   } catch {
+    if (looksLikeCaptchaText(body.text)) throw captchaError(body.status);
     throw new Error("Ozon returned non-JSON composer response");
   }
+
+  if (isCaptchaJson(data)) throw captchaError(body.status);
+  return data;
 }
 
 async function launch() {
@@ -132,7 +172,6 @@ async function launch() {
 
   context = await browser.newContext({
     viewport: { width: 1920, height: 1080 },
-    userAgent: USER_AGENT,
     locale: "ru-RU",
     extraHTTPHeaders: { "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7" },
   });
@@ -149,22 +188,22 @@ async function ensureContext() {
   initPromise = (async () => {
     if (!browser || !browser.isConnected()) await launch();
     mainPage = await context.newPage();
-    log("loading Ozon public session…");
+    log("loading Ozon public session…", safeUrl(HOME));
     await mainPage.goto(HOME, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS });
     await mainPage.waitForTimeout(CHALLENGE_WAIT_MS);
     log("Ozon page loaded:", (await mainPage.title()).slice(0, 40), currentSafePageUrl());
 
     // Resolve regional Ozon origin once during bootstrap. fetchJson itself must not navigate:
-    // details() calls it concurrently, and hidden navigation races on the shared page.
+    // details() calls it sequentially, and hidden navigation would race on the shared page.
     const probe = parseComposerBody(await fetchComposerText("/"));
     if (probe?.redirect) {
-      const target = ozonRedirectTarget(probe.redirect);
+      const target = ozonRedirectTarget(probe.redirect, mainPage.url());
       log("following Ozon regional redirect:", safeUrl(target));
       await mainPage.goto(target, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS });
       await mainPage.waitForTimeout(CHALLENGE_WAIT_MS);
       const state = await mainPage.evaluate(() => ({ title: document.title, text: document.body?.innerText?.slice(0, 300) || "" }));
       if (looksLikeCaptchaText(`${state.title} ${state.text}`)) {
-        throw new Error("Ozon CAPTCHA required / public session unavailable after regional redirect");
+        throw new Error(`${CAPTCHA_ERROR} after regional redirect`);
       }
     }
 
@@ -189,7 +228,7 @@ export async function fetchJson(path, { retries = 1 } = {}) {
       await ensureContext();
       const data = parseComposerBody(await fetchComposerText(path));
       if (data?.redirect) {
-        throw new Error(`Ozon redirect unresolved after bootstrap: ${safeUrl(ozonRedirectTarget(data.redirect))}`);
+        throw new Error(`Ozon redirect unresolved after bootstrap: ${safeUrl(ozonRedirectTarget(data.redirect, mainPage.url()))}`);
       }
       data.__origin = effectiveOrigin;
       return data;
@@ -213,3 +252,5 @@ export async function shutdown() {
   context = null;
   browser = null;
 }
+
+export const _internal = { isOzonHost, validateOzonHome, ozonRedirectTarget, parseComposerBody };

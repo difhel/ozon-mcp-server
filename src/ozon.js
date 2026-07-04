@@ -25,6 +25,13 @@ function currencyForOrigin(origin) {
   return origin && new URL(origin).hostname.endsWith(".ozon.ru") ? "RUB" : null;
 }
 
+function withRegionalPriceGuard(data, currency) {
+  if (currency === "RUB") return data;
+  const scrub = (item) => item ? { ...item, price: null, oldPrice: null, priceRegular: null } : item;
+  if (Array.isArray(data.items)) return { ...data, items: data.items.map(scrub) };
+  return scrub(data);
+}
+
 export async function search({ query, sort = "popular", priceMin, priceMax, limit = 12 }) {
   if (!query || !String(query).trim()) throw new Error("query is required");
   let url = `/search/?text=${encodeURIComponent(query)}&from_global=true`;
@@ -37,7 +44,10 @@ export async function search({ query, sort = "popular", priceMin, priceMax, limi
   }
   const page = await fetchJson(url);
   const { items } = parseSearch(page, limit);
-  return { origin: page.__origin || null, currency: currencyForOrigin(page.__origin), query, sort, count: items.length, items };
+  const origin = page.__origin || null;
+  const currency = currencyForOrigin(origin);
+  const guarded = withRegionalPriceGuard({ items }, currency);
+  return { origin, currency, query, sort, count: guarded.items.length, items: guarded.items };
 }
 
 export async function details({ product }) {
@@ -45,7 +55,9 @@ export async function details({ product }) {
   const basePage = await fetchJson(path);
   const page2 = await fetchJson(`${path}?layout_container=pdpPage2column&layout_page_index=2`);
   const parsed = parseDetails(basePage, page2);
-  return { origin: basePage.__origin || null, currency: currencyForOrigin(basePage.__origin), ...parsed };
+  const origin = basePage.__origin || null;
+  const currency = currencyForOrigin(origin);
+  return { origin, currency, ...withRegionalPriceGuard(parsed, currency) };
 }
 
 export async function reviews({ product, limit = 10 }) {
@@ -54,4 +66,4 @@ export async function reviews({ product, limit = 10 }) {
   return { origin: page.__origin || null, ...parseReviews(page, limit) };
 }
 
-export const _internal = { productPath };
+export const _internal = { productPath, currencyForOrigin, withRegionalPriceGuard };

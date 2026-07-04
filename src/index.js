@@ -46,9 +46,10 @@ server.registerTool(
   {
     title: "Search Ozon products",
     description:
-      "Search products on the Ozon marketplace (ozon.ru). Returns a list of products with name, " +
-      "price (RUB, numeric), old price, discount, rating, review count, brand, image and a clean " +
-      "product URL. Use this to find products and compare prices, then hand the URLs to the user.",
+      "Search products on the Ozon marketplace. Returns products with name, rating, review count, " +
+      "brand, image, clean product URL, origin, and currency. For ozon.ru the price fields are RUB " +
+      "numbers; for regional ozon.com origins currency may be null and price fields may be null " +
+      "until regional currency parsing is reliable.",
     inputSchema: {
       query: z.string().min(1).describe('Search query, e.g. "iphone 15", "плед 150х200", "носки мужские"'),
       sort: z
@@ -69,9 +70,10 @@ server.registerTool(
   {
     title: "Get Ozon product details",
     description:
-      "Get full details for one Ozon product: name, price (card/regular/old), availability, product " +
-      "rating, seller (name + rating), images, key characteristics, and the product description " +
-      "(text and/or banner image URLs). Accepts an SKU, a full product URL, or a slug.",
+      "Get full details for one Ozon product: name, price fields when currency is known, availability, " +
+      "product rating, seller (name + rating), images, key characteristics, and the product description " +
+      "(text and/or banner image URLs). Regional ozon.com origins may return currency null and price " +
+      "fields null to avoid misleading currency values. Accepts an SKU, a full product URL, or a slug.",
     inputSchema: {
       product: z
         .string()

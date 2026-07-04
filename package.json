@@ -9,7 +9,7 @@
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
-    "test:parse": "node test/parse.test.js"
+    "test:parse": "node test/parse.test.js && node test/guardrails.test.js"
   },
   "keywords": ["mcp", "ozon", "marketplace", "search", "playwright"],
   "license": "MIT",
