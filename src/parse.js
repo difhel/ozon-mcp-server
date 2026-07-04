@@ -44,10 +44,14 @@ function priceToNumber(text) {
 }
 
 /** strip ?at=... tracking and make absolute */
-function cleanUrl(link) {
+function cleanUrl(link, origin = "https://www.ozon.ru") {
   if (!link) return null;
-  const path = String(link).split("?")[0];
-  return path.startsWith("http") ? path : `https://www.ozon.ru${path}`;
+  const raw = String(link).split("?")[0];
+  try {
+    return new URL(raw, origin).href;
+  } catch {
+    return null;
+  }
 }
 
 /** pull the numeric sku out of a product url/slug: ...-1185261285/ -> "1185261285" */
@@ -60,7 +64,7 @@ function skuFromUrl(url) {
 // Products live in the `tileGridDesktop-*` widget as `items[]`. Each item carries a
 // `mainState[]` array of typed blocks (priceV2 / textDS name / labelListV2 rating).
 
-function parseSearchItem(it) {
+function parseSearchItem(it, origin) {
   if (!it) return null;
   const ms = Array.isArray(it.mainState) ? it.mainState : [];
 
@@ -101,7 +105,7 @@ function parseSearchItem(it) {
     }
   }
 
-  const url = cleanUrl(it.action?.link);
+  const url = cleanUrl(it.action?.link, origin);
   const sku = String(it.sku || it.id || skuFromUrl(url) || "") || null;
 
   // first image
@@ -128,7 +132,7 @@ function parseSearchItem(it) {
 export function parseSearch(page, limit = 12) {
   const grid = widget(page, "tileGridDesktop");
   const raw = grid?.items || [];
-  const items = raw.map(parseSearchItem).filter(Boolean).slice(0, limit);
+  const items = raw.map((it) => parseSearchItem(it, page?.__origin)).filter(Boolean).slice(0, limit);
   return { count: items.length, items };
 }
 
@@ -177,7 +181,7 @@ function parseSeller(page) {
   if (!w) return null;
   const name = w.sellerCell?.centerBlock?.title?.text || w.title?.text || null;
   const rating = parseFloat(String(w.rating?.title?.text || "").replace(",", ".")) || null;
-  const url = cleanUrl(w.sellerCell?.common?.action?.link);
+  const url = cleanUrl(w.sellerCell?.common?.action?.link, page?.__origin);
   if (!name) return null;
   return { name, rating, url };
 }
@@ -226,8 +230,8 @@ export function parseDetails(basePage, page2) {
     null;
 
   const url =
-    cleanUrl(basePage?.seo?.link?.[0]?.href) ||
-    (sku ? `https://www.ozon.ru/product/${sku}/` : null);
+    cleanUrl(basePage?.seo?.link?.[0]?.href, basePage?.__origin) ||
+    (sku ? `${basePage?.__origin || "https://www.ozon.ru"}/product/${sku}/` : null);
 
   const { rating, reviews } = parseProductScore(basePage);
 

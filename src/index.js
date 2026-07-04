@@ -46,17 +46,18 @@ server.registerTool(
   {
     title: "Search Ozon products",
     description:
-      "Search products on the Ozon marketplace (ozon.ru). Returns a list of products with name, " +
-      "price (RUB, numeric), old price, discount, rating, review count, brand, image and a clean " +
-      "product URL. Use this to find products and compare prices, then hand the URLs to the user.",
+      "Search products on the Ozon marketplace. Returns products with name, rating, review count, " +
+      "brand, image, clean product URL, origin, and currency. For ozon.ru the price fields are RUB " +
+      "numbers and priceMin/priceMax are meaningful. For regional ozon.com origins currency may be " +
+      "null, price fields may be null, and RUB price filters should not be treated as reliable.",
     inputSchema: {
       query: z.string().min(1).describe('Search query, e.g. "iphone 15", "плед 150х200", "носки мужские"'),
       sort: z
         .enum(["popular", "price", "price_desc", "rating", "new", "discount"])
         .default("popular")
         .describe("Sort order: popular (default), price (cheap→expensive), price_desc, rating, new, discount"),
-      priceMin: z.number().int().nonnegative().optional().describe("Minimum price in RUB"),
-      priceMax: z.number().int().nonnegative().optional().describe("Maximum price in RUB"),
+      priceMin: z.number().int().nonnegative().optional().describe("Minimum RUB price filter; reliable only for ozon.ru/RUB sessions"),
+      priceMax: z.number().int().nonnegative().optional().describe("Maximum RUB price filter; reliable only for ozon.ru/RUB sessions"),
       limit: z.number().int().min(1).max(36).default(12).describe("Max number of results (1–36, default 12)"),
     },
     annotations: { readOnlyHint: true, openWorldHint: true, idempotentHint: true },
@@ -69,9 +70,10 @@ server.registerTool(
   {
     title: "Get Ozon product details",
     description:
-      "Get full details for one Ozon product: name, price (card/regular/old), availability, product " +
-      "rating, seller (name + rating), images, key characteristics, and the product description " +
-      "(text and/or banner image URLs). Accepts an SKU, a full product URL, or a slug.",
+      "Get full details for one Ozon product: name, price fields when currency is known, availability, " +
+      "product rating, seller (name + rating), images, key characteristics, and the product description " +
+      "(text and/or banner image URLs). Regional ozon.com origins may return currency null and price " +
+      "fields null to avoid misleading currency values. Accepts an SKU, a full product URL, or a slug.",
     inputSchema: {
       product: z
         .string()
