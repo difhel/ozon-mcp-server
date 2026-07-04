@@ -21,6 +21,10 @@ function productPath(product) {
   return `/product/${p.replace(/^\/+|\/+$/g, "")}/`; // slug
 }
 
+function currencyForOrigin(origin) {
+  return origin && new URL(origin).hostname.endsWith(".ozon.ru") ? "RUB" : null;
+}
+
 export async function search({ query, sort = "popular", priceMin, priceMax, limit = 12 }) {
   if (!query || !String(query).trim()) throw new Error("query is required");
   let url = `/search/?text=${encodeURIComponent(query)}&from_global=true`;
@@ -33,22 +37,21 @@ export async function search({ query, sort = "popular", priceMin, priceMax, limi
   }
   const page = await fetchJson(url);
   const { items } = parseSearch(page, limit);
-  return { query, sort, count: items.length, items };
+  return { origin: page.__origin || null, currency: currencyForOrigin(page.__origin), query, sort, count: items.length, items };
 }
 
 export async function details({ product }) {
   const path = productPath(product);
-  const [basePage, page2] = await Promise.all([
-    fetchJson(path),
-    fetchJson(`${path}?layout_container=pdpPage2column&layout_page_index=2`),
-  ]);
-  return parseDetails(basePage, page2);
+  const basePage = await fetchJson(path);
+  const page2 = await fetchJson(`${path}?layout_container=pdpPage2column&layout_page_index=2`);
+  const parsed = parseDetails(basePage, page2);
+  return { origin: basePage.__origin || null, currency: currencyForOrigin(basePage.__origin), ...parsed };
 }
 
 export async function reviews({ product, limit = 10 }) {
   const path = productPath(product);
   const page = await fetchJson(`${path}reviews/`);
-  return parseReviews(page, limit);
+  return { origin: page.__origin || null, ...parseReviews(page, limit) };
 }
 
 export const _internal = { productPath };

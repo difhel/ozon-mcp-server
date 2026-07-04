@@ -5,18 +5,15 @@
 // Design (per researched best practices):
 //  - lazy init: browser launches on first call, not at startup
 //  - one browser + one context for the process; cookies live in the context
-//  - page pool so concurrent fetches don't share window state
 //  - browser 'disconnected' -> null refs -> transparent relaunch on next call
-//  - context.route aborts images/fonts/media/css (we only need JS + JSON)
-//  - idle timer (unref'd) closes the browser to free RAM; relaunches on demand
 //  - all logs go to stderr (stdout is the MCP JSON-RPC wire)
 
 import { chromium } from "playwright";
 
 const HOME = "https://www.ozon.ru/";
-const API = "https://www.ozon.ru/api/composer-api.bx/page/json/v2?url=";
-const CHALLENGE_WAIT_MS = 12000; // time for the JS challenge to set cookies on first load
-const IDLE_TIMEOUT_MS = 10 * 60 * 1000; // close browser after 10 min idle
+const API_PATH = "/api/composer-api.bx/page/json/v2?url=";
+const CHALLENGE_WAIT_MS = 12000;
+const IDLE_TIMEOUT_MS = 10 * 60 * 1000;
 const NAV_TIMEOUT_MS = 90000;
 
 const LAUNCH_ARGS = [
@@ -32,15 +29,16 @@ const LAUNCH_ARGS = [
   "--disable-background-networking",
 ];
 const USER_AGENT =
-  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.7778.0 Safari/537.36";
 
 const log = (...a) => console.error("[browser]", ...a);
 
 let browser = null;
 let context = null;
-let mainPage = null; // the page that passed the challenge; all fetches run from it (stays on ozon.ru)
+let mainPage = null;
 let initPromise = null;
-let challenged = false; // has the current context passed the challenge?
+let challenged = false;
+let effectiveOrigin = null;
 let idleTimer = null;
 
 function resetIdle() {
@@ -49,7 +47,75 @@ function resetIdle() {
     log("idle timeout — closing browser to free RAM");
     shutdown().catch(() => {});
   }, IDLE_TIMEOUT_MS);
-  idleTimer.unref(); // never keep the process alive just for this timer
+  idleTimer.unref();
+}
+
+function isOzonHost(hostname) {
+  return /(^|\.)ozon\.(ru|com)$/i.test(hostname);
+}
+
+function safeUrl(url) {
+  try {
+    const u = new URL(url, HOME);
+    return `${u.origin}${u.pathname}`;
+  } catch {
+    return "<unknown>";
+  }
+}
+
+function currentSafePageUrl() {
+  return safeUrl(mainPage?.url() || HOME);
+}
+
+function looksLikeCaptchaText(text = "") {
+  return /antibot|captcha|captchaURL|incidentId|капч|пазл|подтвердите,? что вы не бот|ограничен|доступ/i.test(text);
+}
+
+function pageOrigin() {
+  try {
+    const u = new URL(mainPage?.url() || HOME);
+    if (!isOzonHost(u.hostname)) throw new Error(`unexpected Ozon page host: ${u.hostname}`);
+    return u.origin;
+  } catch (err) {
+    throw new Error(`Cannot determine safe Ozon origin: ${err?.message || err}`);
+  }
+}
+
+function ozonRedirectTarget(redirectUrl) {
+  const u = new URL(redirectUrl, mainPage?.url() || HOME);
+  if (u.pathname === "/ozonid/domain_redirect" && u.searchParams.get("domain")) {
+    const domain = u.searchParams.get("domain");
+    if (!isOzonHost(domain)) throw new Error(`Refusing non-Ozon redirect domain: ${domain}`);
+    const redirectUri = u.searchParams.get("redirect_uri") || "/";
+    if (!redirectUri.startsWith("/") || redirectUri.startsWith("//")) {
+      throw new Error("Refusing unsafe Ozon redirect path");
+    }
+    return `https://${domain}${redirectUri}`;
+  }
+  if (!isOzonHost(u.hostname)) throw new Error(`Refusing non-Ozon redirect host: ${u.hostname}`);
+  return u.href;
+}
+
+async function fetchComposerText(sitePath) {
+  return mainPage.evaluate(async ({ apiPath, sitePath }) => {
+    const r = await fetch(apiPath + encodeURIComponent(sitePath), {
+      headers: { accept: "application/json" },
+      credentials: "include",
+    });
+    return { status: r.status, url: r.url, text: await r.text() };
+  }, { apiPath: API_PATH, sitePath });
+}
+
+function parseComposerBody(body) {
+  if (body.status === 403 || looksLikeCaptchaText(body.text)) {
+    throw new Error(`Ozon CAPTCHA required / public session unavailable (HTTP ${body.status})`);
+  }
+  if (body.status !== 200) throw new Error(`Ozon returned HTTP ${body.status}`);
+  try {
+    return JSON.parse(body.text);
+  } catch {
+    throw new Error("Ozon returned non-JSON composer response");
+  }
 }
 
 async function launch() {
@@ -61,18 +127,17 @@ async function launch() {
     context = null;
     mainPage = null;
     challenged = false;
+    effectiveOrigin = null;
   });
 
   context = await browser.newContext({
     viewport: { width: 1920, height: 1080 },
     userAgent: USER_AGENT,
     locale: "ru-RU",
+    extraHTTPHeaders: { "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7" },
   });
-
-  // NOTE: do NOT block stylesheet/image/font/media here — the Variti anti-bot challenge
-  // loads its scripts/assets through those request types, and aborting them makes the
-  // challenge fail (Ozon then returns HTTP 403 to the composer API).
   challenged = false;
+  effectiveOrigin = null;
 }
 
 async function ensureContext() {
@@ -83,18 +148,29 @@ async function ensureContext() {
   }
   initPromise = (async () => {
     if (!browser || !browser.isConnected()) await launch();
-    // Pass the anti-bot challenge once: load the home page, let its JS run and set cookies.
-    // Keep this very page open — all fetches run from it, so they inherit the passed origin/session.
     mainPage = await context.newPage();
-    log("passing anti-bot challenge…");
+    log("loading Ozon public session…");
     await mainPage.goto(HOME, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS });
     await mainPage.waitForTimeout(CHALLENGE_WAIT_MS);
-    const title = await mainPage.title();
-    if (/antibot|ограничен|доступ/i.test(title)) {
-      throw new Error(`challenge not passed (title: ${title})`);
+    log("Ozon page loaded:", (await mainPage.title()).slice(0, 40), currentSafePageUrl());
+
+    // Resolve regional Ozon origin once during bootstrap. fetchJson itself must not navigate:
+    // details() calls it concurrently, and hidden navigation races on the shared page.
+    const probe = parseComposerBody(await fetchComposerText("/"));
+    if (probe?.redirect) {
+      const target = ozonRedirectTarget(probe.redirect);
+      log("following Ozon regional redirect:", safeUrl(target));
+      await mainPage.goto(target, { waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS });
+      await mainPage.waitForTimeout(CHALLENGE_WAIT_MS);
+      const state = await mainPage.evaluate(() => ({ title: document.title, text: document.body?.innerText?.slice(0, 300) || "" }));
+      if (looksLikeCaptchaText(`${state.title} ${state.text}`)) {
+        throw new Error("Ozon CAPTCHA required / public session unavailable after regional redirect");
+      }
     }
+
+    effectiveOrigin = pageOrigin();
     challenged = true;
-    log("challenge passed:", title.slice(0, 40));
+    log("using Ozon origin:", effectiveOrigin);
   })();
   try {
     await initPromise;
@@ -106,30 +182,17 @@ async function ensureContext() {
 
 const DEAD = /Target page, context or browser has been closed|Session closed|Connection closed|browser has been closed/i;
 
-/**
- * Fetch a composer-api page as parsed JSON for the given site path (e.g. "/search/?text=...").
- * Runs fetch() from the challenged main page (which stays on ozon.ru, so cookies + origin apply).
- * Pure fetch() with no navigation/DOM mutation is safe to run concurrently on one page.
- * Retries once on HTTP 403/307 (expired session) or a dead browser by relaunching.
- */
 export async function fetchJson(path, { retries = 1 } = {}) {
   for (let attempt = 0; ; attempt++) {
     try {
       resetIdle();
       await ensureContext();
-      const body = await mainPage.evaluate(async (url) => {
-        const r = await fetch(url, { headers: { accept: "application/json" } });
-        return { status: r.status, text: await r.text() };
-      }, API + encodeURIComponent(path));
-
-      if (body.status !== 200) {
-        if ((body.status === 403 || body.status === 307) && attempt < retries) {
-          await shutdown(); // session expired → relaunch + re-challenge
-          continue;
-        }
-        throw new Error(`Ozon returned HTTP ${body.status}`);
+      const data = parseComposerBody(await fetchComposerText(path));
+      if (data?.redirect) {
+        throw new Error(`Ozon redirect unresolved after bootstrap: ${safeUrl(ozonRedirectTarget(data.redirect))}`);
       }
-      return JSON.parse(body.text);
+      data.__origin = effectiveOrigin;
+      return data;
     } catch (err) {
       if (DEAD.test(String(err?.message)) && attempt < retries) {
         await shutdown();
@@ -143,13 +206,10 @@ export async function fetchJson(path, { retries = 1 } = {}) {
 export async function shutdown() {
   clearTimeout(idleTimer);
   challenged = false;
+  effectiveOrigin = null;
   mainPage = null;
-  try {
-    await context?.close();
-  } catch {}
-  try {
-    await browser?.close();
-  } catch {}
+  try { await context?.close(); } catch {}
+  try { await browser?.close(); } catch {}
   context = null;
   browser = null;
 }
